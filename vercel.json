@@ -1,0 +1,10 @@
+
+ {
+  "version": 2,
+  "builds": [
+    { "src": "api/chat.js", "use": "@vercel/node" }
+  ],
+  "rewrites": [
+    { "source": "/v1/chat/completions", "destination": "/api/chat" }
+  ]
+}
