@@ -71,6 +71,45 @@ async function withBase44(fn) {
   }
 }
 
+// Deduct credits (non-premium) and write usage logs. Shared by both the
+// streaming and non-streaming paths. Never throws — metering must not break
+// the response the client already received.
+async function meterAndLog({ isPremium, credits, tokens, user, key, latency, status }) {
+  const used = Number(tokens) || 0;
+  if (!isPremium && used > 0) {
+    try {
+      await withBase44((b44) =>
+        b44.entities.User.update(user.id, { credits: Math.max(0, credits - used) })
+      );
+    } catch (err) {
+      console.error("credit deduction failed:", err.message);
+    }
+  }
+  try {
+    await withBase44(async (b44) => {
+      await Promise.all([
+        b44.entities.ApiCallLog.create({
+          endpoint: "/api/chat",
+          method: "POST",
+          status_code: status,
+          tokens_used: used,
+          latency_ms: latency,
+          model: MODEL,
+          api_key_id: key.id,
+          key_name: key.name,
+          owner_email: key.owner_email,
+        }),
+        b44.entities.ApiKey.update(key.id, {
+          total_requests: (Number(key.total_requests) || 0) + 1,
+          last_used: new Date().toISOString(),
+        }),
+      ]);
+    });
+  } catch (err) {
+    console.error("logging failed:", err.message);
+  }
+}
+
 export default async function handler(req, res) {
   Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -126,30 +165,111 @@ export default async function handler(req, res) {
   if (messages.length === 0)
     return json(res, 400, { error: "Provide a 'messages' array." });
 
-  const nvidiaBody = JSON.stringify({
+  const wantStream = body.stream === true;
+  const upstreamPayload = {
     model: MODEL,
     messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
     temperature: body.temperature ?? 1,
     top_p: body.top_p ?? 0.95,
-    max_tokens: body.max_tokens ?? 16384,
-    stream: false,
-  });
+    max_tokens: body.max_tokens ?? 2048,
+    stream: wantStream,
+  };
+  if (wantStream) upstreamPayload.stream_options = { include_usage: true };
+  const nvidiaBody = JSON.stringify(upstreamPayload);
 
-  let nvidiaRes, nvidiaData;
+  // Abort the upstream call before the function itself times out, so the
+  // client gets a clean error instead of a hung connection.
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), 55000);
+
+  let nvidiaRes;
   try {
     nvidiaRes = await fetch(NVIDIA_TARGET, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.NVIDIA_KEY}`,
         "Content-Type": "application/json",
-        Accept: "application/json",
+        Accept: wantStream ? "text/event-stream" : "application/json",
       },
       body: nvidiaBody,
+      signal: controller.signal,
     });
+  } catch (err) {
+    clearTimeout(abortTimer);
+    const timedOut = err.name === "AbortError";
+    return json(res, timedOut ? 504 : 502, {
+      error: timedOut ? "Model timed out." : "Failed to reach the model.",
+      detail: err.message,
+    });
+  }
+
+  // ---- Streaming path: forward Server-Sent Events straight to the client ----
+  if (wantStream) {
+    if (!nvidiaRes.ok) {
+      clearTimeout(abortTimer);
+      const errText = await nvidiaRes.text().catch(() => "");
+      return json(res, 502, {
+        error: "Model error.",
+        detail: errText || `NVIDIA returned ${nvidiaRes.status}`,
+      });
+    }
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+
+    let streamedTokens = 0;
+    let buffer = "";
+    try {
+      for await (const chunk of nvidiaRes.body) {
+        const text = chunk.toString("utf-8");
+        res.write(text);
+        // Peek at usage so we can still meter credits after the stream ends.
+        buffer += text;
+        let nl;
+        while ((nl = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (line.startsWith("data:")) {
+            const payload = line.slice(5).trim();
+            if (payload && payload !== "[DONE]") {
+              try {
+                const j = JSON.parse(payload);
+                if (j.usage?.total_tokens) streamedTokens = j.usage.total_tokens;
+              } catch {}
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Client disconnected or upstream aborted mid-stream; nothing more to send.
+    } finally {
+      clearTimeout(abortTimer);
+      res.end();
+    }
+
+    const latency = Date.now() - startedAt;
+    // Fire-and-forget metering/logging; the response is already sent.
+    meterAndLog({
+      isPremium,
+      credits,
+      tokens: streamedTokens,
+      user,
+      key,
+      latency,
+      status: 200,
+    });
+    return;
+  }
+
+  // ---- Non-streaming path ----
+  let nvidiaData;
+  try {
     nvidiaData = await nvidiaRes.json();
   } catch (err) {
-    return json(res, 502, { error: "Failed to reach the model.", detail: err.message });
+    clearTimeout(abortTimer);
+    return json(res, 502, { error: "Invalid response from model.", detail: err.message });
   }
+  clearTimeout(abortTimer);
 
   if (!nvidiaRes.ok || nvidiaData.error) {
     return json(res, 502, {
@@ -164,39 +284,7 @@ export default async function handler(req, res) {
   const tokens = Number(nvidiaData.usage?.total_tokens) || 0;
   const latency = Date.now() - startedAt;
 
-  if (!isPremium && tokens > 0) {
-    try {
-      await withBase44((b44) =>
-        b44.entities.User.update(user.id, { credits: Math.max(0, credits - tokens) })
-      );
-    } catch (err) {
-      console.error("credit deduction failed:", err.message);
-    }
-  }
-
-  try {
-    await withBase44(async (b44) => {
-      await Promise.all([
-        b44.entities.ApiCallLog.create({
-          endpoint: "/api/chat",
-          method: "POST",
-          status_code: 200,
-          tokens_used: tokens,
-          latency_ms: latency,
-          model: MODEL,
-          api_key_id: key.id,
-          key_name: key.name,
-          owner_email: key.owner_email,
-        }),
-        b44.entities.ApiKey.update(key.id, {
-          total_requests: (Number(key.total_requests) || 0) + 1,
-          last_used: new Date().toISOString(),
-        }),
-      ]);
-    });
-  } catch (err) {
-    console.error("logging failed:", err.message);
-  }
+  await meterAndLog({ isPremium, credits, tokens, user, key, latency, status: 200 });
 
   return json(res, 200, {
     id: nvidiaData.id || `chatcmpl-${Date.now()}`,
