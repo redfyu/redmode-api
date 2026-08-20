@@ -1,10 +1,11 @@
-
- {
-  "version": 2,
-  "builds": [
-    { "src": "api/chat.js", "use": "@vercel/node" }
-  ],
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     { "source": "/v1/chat/completions", "destination": "/api/chat" }
-  ]
+  ],
+  "functions": {
+    "api/chat.js": {
+      "maxDuration": 60
+    }
+  }
 }
