@@ -74,6 +74,15 @@ async function withBase44(fn) {
 export default async function handler(req, res) {
   Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
   if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === "GET")
+    return json(res, 200, {
+      status: "ok",
+      service: "REDMODE API",
+      endpoint: "/v1/chat/completions",
+      method: "POST",
+      message:
+        "REDMODE is live. Send a POST to /v1/chat/completions with an Authorization: Bearer rm_... header and a JSON body containing a 'messages' array.",
+    });
   if (req.method !== "POST")
     return json(res, 405, { error: "Method not allowed. Use POST." });
 
