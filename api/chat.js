@@ -198,9 +198,9 @@ export default async function handler(req, res) {
     messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
     temperature: body.temperature ?? 1,
     top_p: body.top_p ?? 0.95,
-    // Keep the default response short enough for Colab's 30-second client timeout.
+    // Keep non-streaming responses comfortably inside Colab's 30-second timeout.
     // Callers can request more, but never more than 2048 tokens per request.
-    max_tokens: Math.min(Math.max(Number(body.max_tokens) || 512, 1), 2048),
+    max_tokens: Math.min(Math.max(Number(body.max_tokens) || 256, 1), 2048),
     // Nemotron supports disabling its reasoning channel at the provider layer.
     // This keeps internal thinking out of the public chat completion entirely.
     chat_template_kwargs: { enable_thinking: false },
@@ -212,7 +212,8 @@ export default async function handler(req, res) {
   // Abort the upstream call before the function itself times out, so the
   // client gets a clean error instead of a hung connection.
   const controller = new AbortController();
-  const abortTimer = setTimeout(() => controller.abort(), 55000);
+  // Return before the common 30-second Colab client timeout.
+  const abortTimer = setTimeout(() => controller.abort(), 24000);
 
   let nvidiaRes;
   try {
