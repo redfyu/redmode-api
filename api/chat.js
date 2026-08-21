@@ -193,7 +193,9 @@ export default async function handler(req, res) {
     messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
     temperature: body.temperature ?? 1,
     top_p: body.top_p ?? 0.95,
-    max_tokens: body.max_tokens ?? 2048,
+    // Keep the default response short enough for Colab's 30-second client timeout.
+    // Callers can request more, but never more than 2048 tokens per request.
+    max_tokens: Math.min(Math.max(Number(body.max_tokens) || 512, 1), 2048),
     stream: wantStream,
   };
   if (wantStream) upstreamPayload.stream_options = { include_usage: true };
