@@ -15,11 +15,16 @@ function sanitizeAssistantContent(content) {
     .replace(/<\|(?:thought|thinking|analysis)\|>[\s\S]*?<\|end\|>/gi, "")
     .trim();
 
-  // Do not expose a response that is only a narrated thinking process.
-  if (/^(here(?:'|’)s|this is)\s+(my\s+)?thinking process\s*:/i.test(cleaned)) {
-    const finalMarker = cleaned.search(/\n\s*(?:final answer|answer)\s*:\s*/i);
+  // Do not expose narrated reasoning if the provider ignores the thinking flag.
+  const thinkingHeader = cleaned.match(
+    /^(?:here(?:'|’)s|this is)\s+(?:my\s+)?thinking process\s*:/i
+  );
+  if (thinkingHeader) {
+    const finalMarker = cleaned.search(
+      /(?:^|\n)\s*(?:final answer|final response|answer)\s*:\s*/i
+    );
     cleaned = finalMarker >= 0
-      ? cleaned.slice(finalMarker).replace(/^\s*(?:final answer|answer)\s*:\s*/i, "")
+      ? cleaned.slice(finalMarker).replace(/^\s*(?:final answer|final response|answer)\s*:\s*/i, "")
       : "";
   }
 
@@ -196,6 +201,9 @@ export default async function handler(req, res) {
     // Keep the default response short enough for Colab's 30-second client timeout.
     // Callers can request more, but never more than 2048 tokens per request.
     max_tokens: Math.min(Math.max(Number(body.max_tokens) || 512, 1), 2048),
+    // Nemotron supports disabling its reasoning channel at the provider layer.
+    // This keeps internal thinking out of the public chat completion entirely.
+    chat_template_kwargs: { enable_thinking: false },
     stream: wantStream,
   };
   if (wantStream) upstreamPayload.stream_options = { include_usage: true };
@@ -246,7 +254,9 @@ export default async function handler(req, res) {
     try {
       for await (const chunk of nvidiaRes.body) {
         const text = chunk.toString("utf-8");
-        res.write(text);
+        // Keep the OpenAI-compatible stream shape, but never expose the
+        // provider model identifier in streamed JSON either.
+        res.write(text.replaceAll(MODEL, PUBLIC_MODEL));
         // Peek at usage so we can still meter credits after the stream ends.
         buffer += text;
         let nl;
